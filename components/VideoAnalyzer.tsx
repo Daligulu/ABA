@@ -2,67 +2,77 @@
 
 import React, { useRef, useState } from 'react'
 import ConfigPanel from '@/components/ConfigPanel'
-import { DEFAULT_CONFIG, type CoachConfig } from '@/config/coach'
 import ScoreRadar from '@/components/ScoreRadar'
+import { DEFAULT_CONFIG, type CoachConfig } from '@/config/coach'
 
-// 这个版本的 VideoAnalyzer 是为了解决“对齐与平衡=0”这个问题的
-// 保持原有的评分思路，只是把最容易掉成 0 分的两项加了“地板分+更宽容差”
-// 注意：真正的 TF.js 姿态识别代码可以继续接在 handleStart 里，这里我们先保留结构
+// 这版是修掉 Vercel 报的 “Unexpected eof” 的完整文件版
+// 同时保留了你要的：对齐与平衡、重心稳定不要动不动就是 0 分
 
-const MIN_BALANCE_FLOOR = 42  // 不要出现 0 分，给个合理地板
+const MIN_BALANCE_FLOOR = 42
 const MIN_ALIGNMENT_FLOOR = 45
 
 function simulateFrameScore(cfg: CoachConfig) {
-  const { thresholds, scoring } = cfg
-  // 假装每一帧都有一个原始值（真实逻辑里是姿态分析后的角度/偏移量）
-  const knee = 98  // 膝盖深度
-  const follow = 0.3 // 跟随动作幅度
-  const rawBalance = 0.18 // 重心摆动
-  const rawAlign = 0.09 // 侧向偏移
+  // 这里模拟一帧的原始数据，真实情况你就换成姿态识别的输出
+  const rawKneeDepth = 98 // 膝盖深度
+  const rawFollow = 0.32  // 随挥程度
+  const rawBalance = 0.18 // 重心横向摆动（越小越好）
+  const rawAlign = 0.09   // 肩/髋出手对齐角（越小越好）
 
-  // 下肢发力：基本按照原来的 >= / <= 规则
-  const legScore = knee >= thresholds.kneeMin ? 95 : 65
-
-  // 出手动作：和跟随动作相关
-  const followTol = thresholds.followThrough.tolerance ?? 0.25
-  const upperScore = follow >= (thresholds.followThrough.target ?? 0.35) - followTol ? 92 : 70
-
-  // 重心稳定：原来极可能因为一个峰值 >0.1 直接到 0，这里做软切
-  // 目标是 0，越大越差，我们把 0~0.35 做三段映射
-  let balanceScore: number
-  if (rawBalance <= (scoring.balance?.center100 ?? 0.25)) {
-    // 完美或接近完美
-    balanceScore = 100 - rawBalance * 60
-  } else if (rawBalance <= 0.35) {
-    // 宽容段：逐步下降
-    balanceScore = 85 - (rawBalance - 0.25) * 400
+  // 下肢
+  const kneeMin = cfg.thresholds.kneeMin
+  const kneeMax = cfg.thresholds.kneeMax ?? 140
+  let legs: number
+  if (rawKneeDepth >= kneeMax) {
+    legs = 100
+  } else if (rawKneeDepth >= kneeMin) {
+    const t = (rawKneeDepth - kneeMin) / (kneeMax - kneeMin || 1)
+    legs = 85 + t * 15
   } else {
-    // 超出阈值：给底分，别归零
-    balanceScore = 55
+    legs = 55
   }
-  balanceScore = Math.max(balanceScore, MIN_BALANCE_FLOOR)
 
-  // 对齐评分：以前是 0.12 一刀切，这里分三档
-  let alignScore: number
-  const alignTol = thresholds.alignment.tolerance ?? 0.12
+  // 上肢
+  const followTarget = cfg.thresholds.followThrough.target ?? 0.35
+  const followTol = cfg.thresholds.followThrough.tolerance ?? 0.25
+  let upper: number
+  if (rawFollow >= followTarget) {
+    upper = 95
+  } else if (rawFollow >= followTarget - followTol) {
+    const t = (rawFollow - (followTarget - followTol)) / (followTol || 1)
+    upper = 80 + t * 15
+  } else {
+    upper = 60
+  }
+
+  // 重心稳定（最关键：给宽容 + 地板分）
+  const center100 = cfg.scoring?.balance?.center100 ?? 0.25
+  let balance: number
+  if (rawBalance <= center100) {
+    balance = 100 - rawBalance * 50
+  } else if (rawBalance <= center100 * 1.4) {
+    balance = 86 - (rawBalance - center100) * 350
+  } else {
+    balance = 55
+  }
+  balance = Math.max(balance, MIN_BALANCE_FLOOR)
+
+  // 对齐评分（同样三段 + 地板）
+  const alignTol = cfg.thresholds.alignment.tolerance ?? 0.12
+  let align: number
   if (rawAlign <= alignTol * 0.5) {
-    alignScore = 98
+    align = 98
   } else if (rawAlign <= alignTol) {
-    alignScore = 85 - (rawAlign - alignTol * 0.5) * 420
+    align = 85 - (rawAlign - alignTol * 0.5) * 420
   } else if (rawAlign <= alignTol * 1.4) {
-    // 超一点点也给分
-    alignScore = 70 - (rawAlign - alignTol) * 320
+    align = 70 - (rawAlign - alignTol) * 320
   } else {
-    alignScore = 58
+    align = 58
   }
-  alignScore = Math.max(alignScore, MIN_ALIGNMENT_FLOOR)
+  align = Math.max(align, MIN_ALIGNMENT_FLOOR)
 
-  return {
-    legs: Math.round(legScore),
-    upper: Math.round(upperScore),
-    balance: Math.round(balanceScore),
-    align: Math.round(alignScore),
-  }
+  const total = Math.round(legs * 0.28 + upper * 0.24 + balance * 0.24 + align * 0.24)
+
+  return { legs: Math.round(legs), upper: Math.round(upper), balance: Math.round(balance), align: Math.round(align), total }
 }
 
 export default function VideoAnalyzer() {
@@ -83,15 +93,13 @@ export default function VideoAnalyzer() {
   function handleStart() {
     if (!videoUrl) return
     setIsAnalyzing(true)
-    // 这里本来应该逐帧跑姿态识别，我们先用当前配置模拟一下结果
     const s = simulateFrameScore(config)
     setScore(s)
-    setTimeout(() => setIsAnalyzing(false), 400)
+    setTimeout(() => setIsAnalyzing(false), 300)
   }
 
   function handleConfigChange(next: CoachConfig) {
     setConfig(next)
-    // 配置一改，重新算一次分数，用户能马上看到是否还会掉成 0
     const s = simulateFrameScore(next)
     setScore(s)
   }
@@ -154,6 +162,10 @@ export default function VideoAnalyzer() {
             <span>对齐与平衡</span>
             <span className="font-mono">{score.align}</span>
           </div>
+          <div className="flex justify-between border-t border-slate-700 pt-2 mt-2 text-slate-200">
+            <span>综合得分</span>
+            <span className="font-mono">{score.total}</span>
+          </div>
         </div>
       </div>
 
@@ -164,4 +176,5 @@ export default function VideoAnalyzer() {
         onClose={() => setConfigOpen(false)}
       />
     </div>
-  
+  )
+}
