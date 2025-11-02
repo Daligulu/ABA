@@ -1,107 +1,142 @@
 'use client'
 
-import React, { useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import ConfigPanel from '@/components/ConfigPanel'
 import ScoreRadar from '@/components/ScoreRadar'
 import { DEFAULT_CONFIG, type CoachConfig } from '@/config/coach'
+import { loadPoseEngine, type PoseResult } from '@/lib/pose/poseEngine'
+import { scoreFromPose } from '@/lib/score/scorer'
 
-// 这版是修掉 Vercel 报的 “Unexpected eof” 的完整文件版
-// 同时保留了你要的：对齐与平衡、重心稳定不要动不动就是 0 分
+/**
+ * 这一版把"开始分析"真正打通：
+ * - 加载一个轻量姿态引擎占位（lib/pose/poseEngine.ts）
+ * - 用 requestAnimationFrame 循环估计关键点
+ * - 在 <canvas> 画关键点与连线，形成"姿态跟踪"效果
+ * - 使用 lib/score/scorer.ts 计算分数并实时更新
+ *
+ * 架构与依赖不变（Next.js + 前端推理占位），只补功能。
+ */
 
 const MIN_BALANCE_FLOOR = 42
 const MIN_ALIGNMENT_FLOOR = 45
 
-function simulateFrameScore(cfg: CoachConfig) {
-  // 这里模拟一帧的原始数据，真实情况你就换成姿态识别的输出
-  const rawKneeDepth = 98 // 膝盖深度
-  const rawFollow = 0.32  // 随挥程度
-  const rawBalance = 0.18 // 重心横向摆动（越小越好）
-  const rawAlign = 0.09   // 肩/髋出手对齐角（越小越好）
-
-  // 下肢
-  const kneeMin = cfg.thresholds.kneeMin
-  const kneeMax = cfg.thresholds.kneeMax ?? 140
-  let legs: number
-  if (rawKneeDepth >= kneeMax) {
-    legs = 100
-  } else if (rawKneeDepth >= kneeMin) {
-    const t = (rawKneeDepth - kneeMin) / (kneeMax - kneeMin || 1)
-    legs = 85 + t * 15
-  } else {
-    legs = 55
-  }
-
-  // 上肢
-  const followTarget = cfg.thresholds.followThrough.target ?? 0.35
-  const followTol = cfg.thresholds.followThrough.tolerance ?? 0.25
-  let upper: number
-  if (rawFollow >= followTarget) {
-    upper = 95
-  } else if (rawFollow >= followTarget - followTol) {
-    const t = (rawFollow - (followTarget - followTol)) / (followTol || 1)
-    upper = 80 + t * 15
-  } else {
-    upper = 60
-  }
-
-  // 重心稳定（最关键：给宽容 + 地板分）
-  const center100 = cfg.scoring?.balance?.center100 ?? 0.25
-  let balance: number
-  if (rawBalance <= center100) {
-    balance = 100 - rawBalance * 50
-  } else if (rawBalance <= center100 * 1.4) {
-    balance = 86 - (rawBalance - center100) * 350
-  } else {
-    balance = 55
-  }
-  balance = Math.max(balance, MIN_BALANCE_FLOOR)
-
-  // 对齐评分（同样三段 + 地板）
-  const alignTol = cfg.thresholds.alignment.tolerance ?? 0.12
-  let align: number
-  if (rawAlign <= alignTol * 0.5) {
-    align = 98
-  } else if (rawAlign <= alignTol) {
-    align = 85 - (rawAlign - alignTol * 0.5) * 420
-  } else if (rawAlign <= alignTol * 1.4) {
-    align = 70 - (rawAlign - alignTol) * 320
-  } else {
-    align = 58
-  }
-  align = Math.max(align, MIN_ALIGNMENT_FLOOR)
-
-  const total = Math.round(legs * 0.28 + upper * 0.24 + balance * 0.24 + align * 0.24)
-
-  return { legs: Math.round(legs), upper: Math.round(upper), balance: Math.round(balance), align: Math.round(align), total }
-}
-
 export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const rafRef = useRef<number | null>(null)
+  const engineRef = useRef<Awaited<ReturnType<typeof loadPoseEngine>> | null>(null)
+
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [configOpen, setConfigOpen] = useState(false)
   const [config, setConfig] = useState<CoachConfig>(DEFAULT_CONFIG)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
-  const [score, setScore] = useState(() => simulateFrameScore(DEFAULT_CONFIG))
+  const [score, setScore] = useState({ legs: 0, upper: 0, balance: 0, align: 0, total: 0 })
+  const [pose, setPose] = useState<PoseResult | null>(null)
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0]
     if (!f) return
     const url = URL.createObjectURL(f)
     setVideoUrl(url)
+    setScore({ legs: 0, upper: 0, balance: 0, align: 0, total: 0 })
   }
 
-  function handleStart() {
-    if (!videoUrl) return
-    setIsAnalyzing(true)
-    const s = simulateFrameScore(config)
-    setScore(s)
-    setTimeout(() => setIsAnalyzing(false), 300)
+  // 根据视频尺寸同步画布尺寸
+  useEffect(() => {
+    const v = videoRef.current
+    const c = canvasRef.current
+    if (!v || !c) return
+    function syncSize() {
+      const w = v.videoWidth || 640
+      const h = v.videoHeight || 360
+      c.width = w
+      c.height = h
+    }
+    v.addEventListener('loadedmetadata', syncSize)
+    return () => v.removeEventListener('loadedmetadata', syncSize)
+  }, [])
+
+  function drawPose(p: PoseResult) {
+    const c = canvasRef.current
+    if (!c) return
+    const ctx = c.getContext('2d')!
+    const w = c.width, h = c.height
+    ctx.clearRect(0, 0, w, h)
+    // 连线（肩-肩、髋-髋、臂、前臂）
+    const by = (name: string) => p.keypoints.find(k => k.name === name)
+    const segs: [string, string][] = [
+      ['left_shoulder', 'right_shoulder'],
+      ['left_hip', 'right_hip'],
+      ['left_shoulder', 'left_elbow'],
+      ['left_elbow', 'left_wrist'],
+      ['right_shoulder', 'right_elbow'],
+      ['right_elbow', 'right_wrist'],
+    ]
+    ctx.lineWidth = 3
+    ctx.strokeStyle = 'rgba(56,189,248,0.9)'
+    for (const [a, b] of segs) {
+      const pa = by(a), pb = by(b)
+      if (!pa || !pb) continue
+      ctx.beginPath()
+      ctx.moveTo(pa.x, pa.y)
+      ctx.lineTo(pb.x, pb.y)
+      ctx.stroke()
+    }
+    // 关键点
+    ctx.fillStyle = 'rgba(34,211,238,0.95)'
+    for (const k of p.keypoints) {
+      ctx.beginPath()
+      ctx.arc(k.x, k.y, 4, 0, Math.PI * 2)
+      ctx.fill()
+    }
   }
+
+  async function handleStart() {
+    if (!videoUrl) return
+    const v = videoRef.current
+    if (!v) return
+
+    // 确保装载姿态引擎
+    if (!engineRef.current) {
+      engineRef.current = await loadPoseEngine()
+    }
+
+    setIsAnalyzing(true)
+    v.play().catch(() => {/* ignore */})
+
+    const loop = async () => {
+      if (!engineRef.current || !v) return
+      try {
+        const p = await engineRef.current.estimate(v)
+        setPose(p)
+        drawPose(p)
+        const s = scoreFromPose(p, config)
+        // 保障不低于地板分
+        const safe = {
+          legs: s.lower,
+          upper: s.upper,
+          balance: Math.max(s.balance, MIN_BALANCE_FLOOR),
+          align: Math.max(s.align, MIN_ALIGNMENT_FLOOR),
+          total: s.overall,
+        }
+        setScore(safe as any)
+      } catch { /* no-op */ }
+      rafRef.current = requestAnimationFrame(loop)
+    }
+
+    // 启动循环
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    rafRef.current = requestAnimationFrame(loop)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    }
+  }, [])
 
   function handleConfigChange(next: CoachConfig) {
     setConfig(next)
-    const s = simulateFrameScore(next)
-    setScore(s)
   }
 
   return (
@@ -130,12 +165,9 @@ export default function VideoAnalyzer() {
           </button>
         </div>
 
-        <div className="relative bg-black/70 rounded-lg overflow-hidden aspect-video max-w-[640px]">
-          {videoUrl ? (
-            <video ref={videoRef} src={videoUrl} controls className="w-full h-full object-contain bg-black" />
-          ) : (
-            <div className="flex h-full items-center justify-center text-slate-500">请先上传一段投篮训练视频</div>
-          )}
+        <div className="relative bg-black/70 rounded-lg overflow-hidden max-w-[720px]">
+          <video ref={videoRef} src={videoUrl ?? ''} controls className="w-full h-auto object-contain bg-black" />
+          <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
         </div>
       </div>
 
@@ -146,26 +178,11 @@ export default function VideoAnalyzer() {
           balance={Math.round((score.balance + score.align) / 2)}
         />
         <div className="bg-slate-800/60 rounded-lg p-3 text-xs space-y-1">
-          <div className="flex justify-between">
-            <span>下肢发力</span>
-            <span className="font-mono">{score.legs}</span>
-          </div>
-          <div className="flex justify-between">
-            <span>上身/跟随</span>
-            <span className="font-mono">{score.upper}</span>
-          </div>
-          <div className="flex justify-between">
-            <span>重心稳定</span>
-            <span className="font-mono">{score.balance}</span>
-          </div>
-          <div className="flex justify-between">
-            <span>对齐与平衡</span>
-            <span className="font-mono">{score.align}</span>
-          </div>
-          <div className="flex justify-between border-t border-slate-700 pt-2 mt-2 text-slate-200">
-            <span>综合得分</span>
-            <span className="font-mono">{score.total}</span>
-          </div>
+          <div className="flex justify-between"><span>下肢发力</span><span className="font-mono">{score.legs}</span></div>
+          <div className="flex justify-between"><span>上身/跟随</span><span className="font-mono">{score.upper}</span></div>
+          <div className="flex justify-between"><span>重心稳定</span><span className="font-mono">{score.balance}</span></div>
+          <div className="flex justify-between"><span>对齐与平衡</span><span className="font-mono">{score.align}</span></div>
+          <div className="flex justify-between border-t border-slate-700 pt-2 mt-2 text-slate-200"><span>综合得分</span><span className="font-mono">{score.total}</span></div>
         </div>
       </div>
 
