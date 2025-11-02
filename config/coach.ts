@@ -1,55 +1,35 @@
-// config/coach.ts
-
-export type ScoreBetter = 'closer' | '>=|' | '<=|'
-
-export type ScoreRule = {
-  target: number
-  tolerance: number
-  unit?: 'deg' | 'pct' | 'px' | 's'
-  better?: ScoreBetter
-}
-
-export type WeightItem = {
-  key: string
-  label: string
-  weight: number
-  rule: ScoreRule
-}
-
-export type WeightBucket = {
-  name: '下肢动力链' | '上肢出手' | '对齐与平衡' | string
-  weight: number
-  items: WeightItem[]
-}
-
-export type ReleaseDetectConfig = {
-  minElbowDeg?: number
-  bodyWidthScale?: number
-}
-
-export type ScoringWindow = {
-  preReleaseSec?: number
-  postReleaseSec?: number
-}
-
 export type CoachConfig = {
-  modelPreference: 'blaze-full' | 'blaze-lite' | 'movenet'
+  modelPreference: 'blaze-full' | 'blaze-lite' | 'movent'
   enableSmartCrop: boolean
   enableOpenCV: boolean
-  smooth: { minCutoff: number; beta: number; dCutoff: number }
+  smooth: {
+    minCutoff: number
+    beta: number
+    dCutoff: number
+  }
   thresholds: {
     kneeMin: number
-    kneeMax: number
-    releaseAngleIdeal: number
-    lateralOffsetMaxPct: number
+    kneeMax?: number
+    followThrough: {
+      target: number
+      tolerance: number
+    }
+    alignment: {
+      tolerance: number
+    }
   }
-  scoring?: ScoringWindow
-  releaseDetect?: ReleaseDetectConfig
-  weights: WeightBucket[]
+  scoring: {
+    balance: {
+      /** 重心在这个范围内记 100 分 */
+      center100: number
+      /** 对齐的角度基准（度） */
+      align100: number
+    }
+  }
 }
 
 export const DEFAULT_CONFIG: CoachConfig = {
-  modelPreference: 'movenet',
+  modelPreference: 'blaze-full',
   enableSmartCrop: true,
   enableOpenCV: false,
   smooth: {
@@ -58,41 +38,24 @@ export const DEFAULT_CONFIG: CoachConfig = {
     dCutoff: 1,
   },
   thresholds: {
-    kneeMin: 60,
+    kneeMin: 95,
     kneeMax: 140,
-    releaseAngleIdeal: 115,
-    lateralOffsetMaxPct: 0.12,
+    followThrough: {
+      target: 0.35,
+      // 放宽挥臂容差，避免轻微动作导致 0 分
+      tolerance: 0.25,
+    },
+    alignment: {
+      // 这里和前端的打分逻辑配套，默认 0.12，前端会允许到 0.12 * 1.4
+      tolerance: 0.12,
+    },
   },
   scoring: {
-    preReleaseSec: 0.45,
-    postReleaseSec: 0.4,
-    releaseAllowance: { minElbowDeg: 15 },
     balance: {
-      center100: 2.5,
+      // 对应我们 scoring.ts 里用的 0.25
+      center100: 0.25,
+      // 这个是角度类基准，前端那里只是拿来展示
       align100: 4,
     },
   },
-  weights: [
-    {
-      name: '我新络',
-      weight: 0.4,
-      items: [
-        {
-          key: 'kneeDepth',
-          label: '膝关节夹角，越接近�fý',
-          weight: 0.3,
-          rule: {
-            target: 95,
-            tolerance: 10,
-            unit: 'deg',
-            better: '==|',
-          },
-        },
-        {
-          key: 'extendSpeed',
-          label: '起跳时膝盖伸展',
-          weight: 0.3,
-          rule: {
-            target: 45,
-            tolerance: 30,
-            unit: 'p
+}
