@@ -1,0 +1,8 @@
+{
+  "version": "1.0.1",
+  "notes": "wider tolerance for balance/alignment, floor to 42/45.",
+  "threshold_patch": {
+    "balance": { "floor": 42 },
+    "alignment": { "floor": 45 }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "version": "1.0.0-fallback-v2",
+  "notes": "Legacy rule-set for 2025-10 release, used when TF backend is disabled.",
+  "weights": {
+    "legs": 0.28,
+    "upper": 0.24,
+    "balance": 0.24,
+    "align": 0.24
+  }
+}
