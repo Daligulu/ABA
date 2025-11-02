@@ -8,17 +8,13 @@ import { loadPoseEngine, type PoseResult } from '@/lib/pose/poseEngine'
 import { scoreFromPose } from '@/lib/score/scorer'
 
 /**
- * 这一版把"开始分析"真正打通：
- * - 加载一个轻量姿态引擎占位（lib/pose/poseEngine.ts）
- * - 用 requestAnimationFrame 循环估计关键点
- * - 在 <canvas> 画关键点与连线，形成"姿态跟踪"效果
- * - 使用 lib/score/scorer.ts 计算分数并实时更新
- *
- * 架构与依赖不变（Next.js + 前端推理占位），只补功能。
+ * 修复 Vercel 构建时报的 TS 严格空值检查（"v 可能为 null"），
+ * 并新增“示例视频”按钮（使用公开可跨域播放的 mp4）。
  */
 
 const MIN_BALANCE_FLOOR = 42
 const MIN_ALIGNMENT_FLOOR = 45
+const DEMO_URL = 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4'
 
 export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -41,19 +37,30 @@ export default function VideoAnalyzer() {
     setScore({ legs: 0, upper: 0, balance: 0, align: 0, total: 0 })
   }
 
-  // 根据视频尺寸同步画布尺寸
+  function handleUseDemo() {
+    setVideoUrl(DEMO_URL)
+    setScore({ legs: 0, upper: 0, balance: 0, align: 0, total: 0 })
+  }
+
+  // 根据视频尺寸同步画布尺寸（使用当前 refs，避免 TS 对闭包里 v 的空值警告）
   useEffect(() => {
-    const v = videoRef.current
-    const c = canvasRef.current
-    if (!v || !c) return
     function syncSize() {
+      const v = videoRef.current
+      const c = canvasRef.current
+      if (!v || !c) return
       const w = v.videoWidth || 640
       const h = v.videoHeight || 360
       c.width = w
       c.height = h
     }
-    v.addEventListener('loadedmetadata', syncSize)
-    return () => v.removeEventListener('loadedmetadata', syncSize)
+    const v = videoRef.current
+    if (v) v.addEventListener('loadedmetadata', syncSize)
+    // 初始也尝试一次
+    syncSize()
+    return () => {
+      const vv = videoRef.current
+      if (vv) vv.removeEventListener('loadedmetadata', syncSize)
+    }
   }, [])
 
   function drawPose(p: PoseResult) {
@@ -96,7 +103,6 @@ export default function VideoAnalyzer() {
     const v = videoRef.current
     if (!v) return
 
-    // 确保装载姿态引擎
     if (!engineRef.current) {
       engineRef.current = await loadPoseEngine()
     }
@@ -105,13 +111,13 @@ export default function VideoAnalyzer() {
     v.play().catch(() => {/* ignore */})
 
     const loop = async () => {
-      if (!engineRef.current || !v) return
+      const vv = videoRef.current
+      if (!engineRef.current || !vv) return
       try {
-        const p = await engineRef.current.estimate(v)
+        const p = await engineRef.current.estimate(vv)
         setPose(p)
         drawPose(p)
         const s = scoreFromPose(p, config)
-        // 保障不低于地板分
         const safe = {
           legs: s.lower,
           upper: s.upper,
@@ -124,7 +130,6 @@ export default function VideoAnalyzer() {
       rafRef.current = requestAnimationFrame(loop)
     }
 
-    // 启动循环
     if (rafRef.current) cancelAnimationFrame(rafRef.current)
     rafRef.current = requestAnimationFrame(loop)
   }
@@ -147,6 +152,12 @@ export default function VideoAnalyzer() {
             <span>上传视频</span>
             <input type="file" accept="video/*" className="hidden" onChange={handleFileChange} />
           </label>
+          <button
+            onClick={handleUseDemo}
+            className="px-3 py-2 rounded bg-slate-700 text-xs text-slate-200"
+          >
+            使用示例视频
+          </button>
           <button
             onClick={() => setConfigOpen(true)}
             className="px-3 py-2 rounded bg-slate-700 text-xs text-slate-200"
